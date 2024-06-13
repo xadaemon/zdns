@@ -1,63 +1,77 @@
 const std = @import("std");
+const network = @import("network");
 const Allocator = std.mem.Allocator;
 const Thead = std.Thread;
-const Mutex = Thead.Mutex;
-const net = std.net;
-const posix = std.posix;
-const process = std.process;
-const print = std.debug.print;
+const log = std.log;
+
+pub const io_mode = .evented;
 
 pub fn main() !void {
-    const alloc = std.heap.c_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    defer _ = gpa.deinit();
 
-    const socket = try std.posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
-    try set_fnctl_flag(socket, posix.SOCK.NONBLOCK, true);
-    defer posix.close(socket);
+    const ip = std.process.getEnvVarOwned(alloc, "ZDNS_BIND_ADDR") catch "127.0.0.1";
+    const port = try std.fmt.parseInt(u16, std.process.getEnvVarOwned(alloc, "ZDNS_BIND_PORT") catch "5000", 10);
 
-    const ip = process.getEnvVarOwned(alloc, "ZDNS_BIND_ADDR") catch "127.0.0.1";
-    const port = try std.fmt.parseInt(u16, process.getEnvVarOwned(alloc, "ZDNS_BIND_PORT") catch "5000", 10);
+    try network.init();
+    defer network.deinit();
 
-    const addr = try net.Address.parseIp4(ip, port);
+    var server = try network.Socket.create(.ipv4, .udp);
 
-    try posix.bind(socket, &addr.any, addr.getOsSockLen());
+    try server.bind(.{ .address = .{ .ipv4 = try network.Address.IPv4.parse(ip) }, .port = port });
 
-    print("Listening on {any}\n", .{addr});
+    log.info("Listening at {any} \n", .{server.getLocalEndPoint()});
 
     while (true) {
-        try on_message(alloc, socket);
+        log.debug("Waiting for client messages\n", .{});
+        const client = try Client.new(alloc, server);
+        errdefer client.deinit();
+        const recv = try server.receiveFrom(client.buf[0..]);
+        client.set_received(recv.sender, recv.numberOfBytes);
+        try client.handle();
+        client.deinit();
     }
+
+    server.close();
 }
 
-fn set_fnctl_flag(fd: posix.fd_t, flag: usize, set: bool) posix.FcntlError!void {
-    var flags = try posix.fcntl(fd, posix.F.GETFL, 0);
-    flags = if (set) flags | flag else flags & ~flag;
-    _ = try posix.fcntl(fd, posix.F.SETFL, flags);
-}
+const SyncRingBuff = struct {
+    mutex: Thead.RwLock,
+    ring: std.RingBuffer
 
-/// Handle a client message on the sock
-fn on_message(alloc: Allocator, sock: posix.socket_t) !void {
-    var client_addr: posix.sockaddr align(4) = undefined;
-    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    var rec_buf: [0x10000]u8 = undefined;
 
-    const n_rd = posix.recvfrom(sock, rec_buf[0..], 0, &client_addr, &client_addr_len) catch |err| {
-        if (err == posix.RecvFromError.WouldBlock) {
-            return;
-        } else {
-            return err;
-        }
-    };
-    const buf = try alloc.alloc(u8, 0x10000);
-    std.mem.copyBackwards(u8, buf, rec_buf[0..n_rd]);
-    print("Read {any} bytes\nDispatching to replier\n", .{n_rd});
+};
 
-    try handle_message(alloc, sock, buf, n_rd, &client_addr, client_addr_len);
-    errdefer alloc.free(buf);
-}
+const Client = struct {
+    alloc: Allocator,
+    conn: network.Socket,
+    buf: []u8,
+    recvep: network.EndPoint,
+    recvnb: usize,
 
-fn handle_message(alloc: Allocator, sock: posix.socket_t, buf: []const u8, read: usize, client_addr: *align(4) const posix.sockaddr, client_addr_len: posix.socklen_t) !void {
-    const n_wt = try posix.sendto(sock, buf[0..read], 0, client_addr, client_addr_len);
-    print("replied with {any} bytes to client @ {any}\n", .{ n_wt, net.Address.initPosix(client_addr) });
-    // Free the buffer that gets allocated by on_message
-    defer alloc.free(buf);
-}
+    fn new(alloc: Allocator, conn: network.Socket) !*Client {
+        const client = try alloc.create(Client);
+        client.buf = try alloc.alloc(u8, 255);
+        client.alloc = alloc;
+        client.conn = conn;
+        return client;
+    }
+
+    fn deinit(self: *Client) void {
+        self.alloc.free(self.buf);
+        self.alloc.destroy(self);
+    }
+
+    fn set_received(self: *Client, recvep: network.EndPoint, recvnb: usize) void {
+        self.recvep = recvep;
+        self.recvnb = recvnb;
+    }
+
+    fn handle(self: *Client) !void {
+        log.debug("Received {any} bytes from peer @ {any}", .{ self.recvnb, self.recvep });
+
+        const renb = try self.conn.sendTo(self.recvep, self.buf[0..self.recvnb]);
+        log.debug("Replied with {any} bytes\n", .{renb});
+    }
+};

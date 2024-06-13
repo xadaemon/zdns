@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.linkLibC();
+    exe.root_module.addImport("network", b.dependency("network", .{}).module("network"));
 
     b.installArtifact(exe);
 
