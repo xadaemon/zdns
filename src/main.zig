@@ -36,7 +36,7 @@ fn set_fnctl_flag(fd: posix.fd_t, flag: usize, set: bool) posix.FcntlError!void 
 
 /// Handle a client message on the sock
 fn on_message(alloc: Allocator, sock: posix.socket_t) !void {
-    var client_addr: posix.sockaddr = undefined;
+    var client_addr: posix.sockaddr align(4) = undefined;
     var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
     var rec_buf: [0x10000]u8 = undefined;
 
@@ -55,14 +55,9 @@ fn on_message(alloc: Allocator, sock: posix.socket_t) !void {
     errdefer alloc.free(buf);
 }
 
-fn handle_message(alloc: Allocator, sock: posix.socket_t, buf: []const u8, read: usize, client_addr: ?*const posix.sockaddr, client_addr_len: posix.socklen_t) !void {
-    const peer_addr = (client_addr orelse return posix.SendToError.AddressNotAvailable).*;
-    var peer_addr_parsed: net.Address = undefined;
-    if (peer_addr.family == posix.AF.INET) {
-        peer_addr_parsed = net.Address.initIp4(peer_addr.data[2..6], std.mem.readInt(u16, peer_addr.data[0..2], std.builtin.Endian.big));
-    }
+fn handle_message(alloc: Allocator, sock: posix.socket_t, buf: []const u8, read: usize, client_addr: *align(4) const posix.sockaddr, client_addr_len: posix.socklen_t) !void {
     const n_wt = try posix.sendto(sock, buf[0..read], 0, client_addr, client_addr_len);
-    print("replied with {any} bytes to client @ {any}\n", .{ n_wt, peer_addr_parsed });
+    print("replied with {any} bytes to client @ {any}\n", .{ n_wt, net.Address.initPosix(client_addr) });
     // Free the buffer that gets allocated by on_message
     defer alloc.free(buf);
 }
